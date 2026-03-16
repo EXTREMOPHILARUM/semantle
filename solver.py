@@ -1,94 +1,84 @@
 """
-Semantle Solver — minimize guesses using information-theoretic word elimination.
+Semantle/Pimantle Solver — minimize guesses using information-theoretic word elimination.
 
-Strategy:
-1. Load word2vec embeddings (Google News 300d via gensim)
-2. Precompute a similarity matrix for candidate words
-3. Each guess returns a cosine similarity score (0-100 scale)
-4. Eliminate all words whose similarity to the guessed word doesn't match
-   the expected similarity (within tolerance)
-5. Pick next guess that maximizes expected candidate elimination
+Uses the exact same word list and word2vec embeddings as Pimantle (106,981 words).
+Each guess + score eliminates candidates whose similarity to the guess doesn't match.
+Next guess is chosen to maximize expected elimination.
 
 Usage:
-    uv run python3 solver.py          # interactive mode against live Semantle
-    uv run python3 solver.py --sim    # simulate against a random target word
-    uv run python3 solver.py --sim --target crab  # simulate against specific word
+    uv run python3 solver.py                          # interactive mode
+    uv run python3 solver.py --sim --target crab      # simulate against a word
+    uv run python3 solver.py --sim                    # simulate against random word
+    uv run python3 solver.py --bench N                # benchmark over N random words
 """
 
+import json
 import numpy as np
+import os
+import struct
 import sys
 import time
+from pathlib import Path
 from sklearn.preprocessing import normalize
-from scipy.spatial.distance import cdist
+
+DATA_DIR = Path(__file__).parent
+WORD_LIST_PATH = DATA_DIR / "word_list.json"
+VECTORS_CACHE = DATA_DIR / "vectors.npz"
 
 # ---------------------------------------------------------------------------
-# Word vectors
+# Load word list + vectors
 # ---------------------------------------------------------------------------
 
-_vectors = None
 _words = None
-_word2idx = None
+_vectors = None
+_w2i = None
 
 
-def load_vectors(limit=50000, model_name=None):
-    """Load word2vec vectors via gensim downloader. Cached after first download."""
-    global _vectors, _words, _word2idx
+def load_word_list():
+    """Load Pimantle's 106k word list."""
+    global _words, _w2i
+    if _words is not None:
+        return _words, _w2i
+    with open(WORD_LIST_PATH) as f:
+        wl = json.load(f)
+    _words = [entry[0] for entry in wl]
+    _w2i = {w: i for i, w in enumerate(_words)}
+    return _words, _w2i
+
+
+def load_vectors():
+    """Load word2vec vectors for the Pimantle word list. Caches to disk."""
+    global _vectors, _words, _w2i
+    words, w2i = load_word_list()
+
     if _vectors is not None:
-        return _words, _vectors, _word2idx
+        return words, _vectors, w2i
 
-    import gensim.downloader as api
+    if VECTORS_CACHE.exists():
+        print("Loading cached vectors...")
+        t0 = time.time()
+        data = np.load(VECTORS_CACHE)
+        _vectors = data["vectors"]
+        print(f"Loaded {_vectors.shape[0]} vectors in {time.time()-t0:.1f}s")
+        return words, _vectors, w2i
 
-    if model_name is None:
-        # Try Google News first; fall back to smaller GloVe if not yet downloaded
-        gn = "word2vec-google-news-300"
-        try:
-            info = api.info()
-            model_dir = api.BASE_DIR
-            import os
-            if os.path.exists(os.path.join(model_dir, gn)):
-                model_name = gn
-            else:
-                print("Google News vectors not yet downloaded.")
-                print("Using glove-wiki-gigaword-300 (~376MB, faster download).")
-                print("For best results, run: uv run python3 -c \"import gensim.downloader as api; api.load('word2vec-google-news-300')\"")
-                model_name = "glove-wiki-gigaword-300"
-        except Exception:
-            model_name = "glove-wiki-gigaword-300"
-
-    print(f"Loading '{model_name}' vectors...")
+    print("Building vector cache from word2vec (one-time, ~30s)...")
     t0 = time.time()
-    model = api.load(model_name)
+    import gensim.downloader as api
+    model = api.load("word2vec-google-news-300")
 
-    # Take top `limit` words (most frequent), filter to clean alpha words
-    words = []
-    vecs = []
-    for w in model.key_to_index:
-        if len(words) >= limit:
-            break
-        # Semantle only uses lowercase single words without special chars
-        if w.isalpha() and w.islower() and len(w) > 1:
-            words.append(w)
-            vecs.append(model[w])
+    dim = 300
+    vecs = np.zeros((len(words), dim), dtype=np.float32)
+    found = 0
+    for i, w in enumerate(words):
+        if w in model:
+            vecs[i] = model[w]
+            found += 1
 
-    _words = words
-    _vectors = normalize(np.array(vecs, dtype=np.float32))
-    _word2idx = {w: i for i, w in enumerate(words)}
-    print(f"Loaded {len(words)} words in {time.time()-t0:.1f}s")
-    return _words, _vectors, _word2idx
-
-
-# ---------------------------------------------------------------------------
-# Similarity helpers
-# ---------------------------------------------------------------------------
-
-def cos_sim(vec_a, mat_b):
-    """Cosine similarity between one vector and a matrix of vectors (all normalized)."""
-    return (mat_b @ vec_a).astype(np.float64)
-
-
-def semantle_score(sim):
-    """Convert raw cosine similarity to Semantle's 0-100 scale."""
-    return np.round(sim * 100, 2)
+    _vectors = normalize(vecs, axis=1).astype(np.float32)
+    np.savez_compressed(VECTORS_CACHE, vectors=_vectors)
+    print(f"Cached {found}/{len(words)} vectors in {time.time()-t0:.1f}s")
+    return words, _vectors, w2i
 
 
 # ---------------------------------------------------------------------------
@@ -96,99 +86,76 @@ def semantle_score(sim):
 # ---------------------------------------------------------------------------
 
 class SemantleSolver:
-    def __init__(self, tolerance=0.25):
-        """
-        tolerance: how close (in Semantle score units) a candidate's expected
-                   similarity must be to the observed score to survive filtering.
-                   Semantle rounds to 2 decimals, so 0.25 is tight.
-        """
+    def __init__(self, tolerance=0.15):
         self.words, self.vectors, self.w2i = load_vectors()
         self.tolerance = tolerance
-        self.candidates = list(range(len(self.words)))  # indices
+        self.candidates = np.arange(len(self.words))
         self.guesses = []
 
     def reset(self):
-        self.candidates = list(range(len(self.words)))
+        self.candidates = np.arange(len(self.words))
         self.guesses = []
 
     def remaining(self):
         return len(self.candidates)
 
     def candidate_words(self):
-        return [self.words[i] for i in self.candidates]
+        return [self.words[i] for i in self.candidates[:20]]
 
     def _pick_best_guess(self):
-        """
-        Pick the word that, on average, eliminates the most candidates.
-
-        For efficiency: sample candidates if too many, and evaluate a subset
-        of potential guesses.
-        """
         n_cand = len(self.candidates)
-
         if n_cand <= 2:
             return self.candidates[0]
 
-        # Subsample candidates for evaluation if needed
-        max_eval = 300  # max candidates to evaluate as potential guesses
-        max_sim_check = 500  # max candidates to check similarity against
+        # Sample candidates for evaluation
+        max_eval = 400
+        max_check = 600
 
-        eval_indices = self.candidates
         if n_cand > max_eval:
-            eval_indices = list(np.random.choice(self.candidates, max_eval, replace=False))
+            eval_idx = np.random.choice(self.candidates, max_eval, replace=False)
+        else:
+            eval_idx = self.candidates
 
-        check_indices = self.candidates
-        if n_cand > max_sim_check:
-            check_indices = list(np.random.choice(self.candidates, max_sim_check, replace=False))
+        if n_cand > max_check:
+            check_idx = np.random.choice(self.candidates, max_check, replace=False)
+        else:
+            check_idx = self.candidates
 
-        check_vecs = self.vectors[check_indices]
-        n_check = len(check_indices)
+        check_vecs = self.vectors[check_idx]
+        n_check = len(check_idx)
 
-        best_guess = eval_indices[0]
-        best_score = 0  # best expected elimination
+        best_guess = eval_idx[0]
+        best_expected_remaining = n_check  # worst case: no elimination
 
-        for gi in eval_indices:
-            gvec = self.vectors[gi]
-            sims = semantle_score(cos_sim(gvec, check_vecs))
+        tol = self.tolerance
+        for gi in eval_idx:
+            # Similarities from this guess to all check candidates
+            sims = (check_vecs @ self.vectors[gi]) * 100.0
+            # Bin by tolerance
+            bins = np.round(sims / tol).astype(np.int32)
+            _, counts = np.unique(bins, return_counts=True)
+            # Expected remaining = E[|bucket|] = sum(count^2) / total
+            expected_remaining = np.sum(counts * counts) / n_check
 
-            # For each possible observed score (bucket by tolerance),
-            # count how many candidates would be eliminated
-            # We approximate by binning similarities
-            bins = np.round(sims / self.tolerance) * self.tolerance
-            unique, counts = np.unique(bins, return_counts=True)
-
-            # Expected remaining after this guess = sum(count^2) / total
-            # (each bin has count candidates; if we land in that bin, count remain)
-            expected_remaining = np.sum(counts ** 2) / n_check
-            expected_eliminated = n_check - expected_remaining
-
-            if expected_eliminated > best_score:
-                best_score = expected_eliminated
+            if expected_remaining < best_expected_remaining:
+                best_expected_remaining = expected_remaining
                 best_guess = gi
 
         return best_guess
 
     def suggest(self):
-        """Suggest the next word to guess."""
         if len(self.candidates) == 0:
             return None
 
-        # First guess: use a word near the center of the embedding space
         if len(self.guesses) == 0:
-            # "the" or similar high-frequency word as anchor
             for starter in ["game", "place", "thing", "water", "light"]:
                 if starter in self.w2i:
                     return starter
-            return self.words[self.candidates[0]]
 
         idx = self._pick_best_guess()
         return self.words[idx]
 
     def update(self, word, score):
-        """
-        After guessing `word` and getting back `score` (Semantle's number),
-        eliminate candidates that don't match.
-        """
         self.guesses.append((word, score))
 
         if word not in self.w2i:
@@ -197,13 +164,11 @@ class SemantleSolver:
 
         gvec = self.vectors[self.w2i[word]]
         cand_vecs = self.vectors[self.candidates]
-        expected_scores = semantle_score(cos_sim(gvec, cand_vecs))
+        expected_scores = (cand_vecs @ gvec) * 100.0
 
-        # Keep candidates whose expected similarity to the guessed word
-        # matches the observed score within tolerance
         mask = np.abs(expected_scores - score) <= self.tolerance
         old_count = len(self.candidates)
-        self.candidates = [self.candidates[i] for i in range(len(self.candidates)) if mask[i]]
+        self.candidates = self.candidates[mask]
         new_count = len(self.candidates)
         print(f"  '{word}' score={score} → eliminated {old_count - new_count}, remaining: {new_count}")
 
@@ -212,10 +177,10 @@ class SemantleSolver:
 
 
 # ---------------------------------------------------------------------------
-# Simulation mode
+# Simulation
 # ---------------------------------------------------------------------------
 
-def simulate(target_word=None):
+def simulate(target_word=None, quiet=False):
     solver = SemantleSolver()
 
     if target_word is None:
@@ -223,41 +188,61 @@ def simulate(target_word=None):
 
     if target_word not in solver.w2i:
         print(f"'{target_word}' not in vocabulary!")
-        return
+        return None
 
-    print(f"Simulating Semantle for target: '{target_word}'")
+    if not quiet:
+        print(f"Simulating for target: '{target_word}'")
+
     target_vec = solver.vectors[solver.w2i[target_word]]
 
     for turn in range(1, 100):
         guess = solver.suggest()
         if guess is None:
-            print("No candidates left — something went wrong!")
+            if not quiet:
+                print("No candidates left!")
             break
 
-        # Compute the score the game would return
-        if guess in solver.w2i:
-            sim = float(target_vec @ solver.vectors[solver.w2i[guess]])
-            score = round(sim * 100, 2)
-        else:
-            score = 0.0
+        sim = float(target_vec @ solver.vectors[solver.w2i[guess]])
+        score = round(sim * 100, 2)
 
-        print(f"  Turn {turn}: guess='{guess}', score={score}, candidates={solver.remaining()}")
+        if not quiet:
+            print(f"  Turn {turn}: guess='{guess}', score={score}, candidates={solver.remaining()}")
 
         solver.update(guess, score)
 
         if score == 100.0 or guess == target_word:
-            print(f"\nSolved '{target_word}' in {turn} guesses!")
+            if not quiet:
+                print(f"\nSolved '{target_word}' in {turn} guesses!")
             return turn
 
-        if solver.remaining() <= 5:
-            print(f"  Top candidates: {solver.candidate_words()[:5]}")
+        if not quiet and solver.remaining() <= 5:
+            print(f"  Top candidates: {solver.candidate_words()}")
 
-    print(f"Failed to solve in 100 guesses")
+    if not quiet:
+        print("Failed to solve in 100 guesses")
     return 100
 
 
+def benchmark(n=50):
+    words, _, _ = load_vectors()
+    targets = np.random.choice(words, n, replace=False)
+    results = []
+    for i, t in enumerate(targets):
+        r = simulate(t, quiet=True)
+        if r is not None:
+            results.append(r)
+            print(f"  [{i+1}/{n}] '{t}' → {r} guesses")
+    results = np.array(results)
+    print(f"\nBenchmark ({len(results)} words):")
+    print(f"  Mean: {results.mean():.1f} guesses")
+    print(f"  Median: {np.median(results):.0f}")
+    print(f"  Min: {results.min()}, Max: {results.max()}")
+    print(f"  ≤3 guesses: {(results <= 3).sum()}/{len(results)} ({(results <= 3).mean()*100:.0f}%)")
+    print(f"  ≤4 guesses: {(results <= 4).sum()}/{len(results)} ({(results <= 4).mean()*100:.0f}%)")
+
+
 # ---------------------------------------------------------------------------
-# Interactive mode (you play Semantle, solver tells you what to guess)
+# Interactive
 # ---------------------------------------------------------------------------
 
 def interactive():
@@ -272,13 +257,13 @@ def interactive():
         guess = solver.suggest()
         if guess is None:
             print("No candidates remaining! Try resetting with 'r'.")
-            guess = input("Manual guess (or 'r'/'q'): ").strip()
-            if guess == 'q':
+            resp = input("(r/q): ").strip()
+            if resp == 'q':
                 break
-            if guess == 'r':
+            if resp == 'r':
                 solver.reset()
                 turn = 0
-                continue
+            continue
 
         print(f"\n  Turn {turn} | Candidates: {solver.remaining()}")
         print(f"  → Guess: {guess}")
@@ -317,7 +302,11 @@ def interactive():
 if __name__ == "__main__":
     args = sys.argv[1:]
 
-    if "--sim" in args:
+    if "--bench" in args:
+        idx = args.index("--bench")
+        n = int(args[idx + 1]) if idx + 1 < len(args) else 50
+        benchmark(n)
+    elif "--sim" in args:
         target = None
         if "--target" in args:
             idx = args.index("--target")
